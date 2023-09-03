@@ -27,7 +27,7 @@
 
 export DOCKER ?= docker
 export DOCKER_RUN_TTY ?= $(DOCKER) run --rm --tty
-export DOCKER_RUN_TTY_INT ?= $(DOCKER_RUN_TTY) --interactive
+export DOCKER_RUN_INT ?= $(DOCKER) run --rm --interactive
 
 export NC ?=
 
@@ -46,6 +46,7 @@ PIKVM_REPO_URL ?= https://files.pikvm.org/repos/arch/
 PIKVM_REPO_KEY ?= 912C773ABBD1B584
 
 CARD ?= /dev/mmcblk0
+IMAGE ?= ./$(PROJECT).$(OS)-$(BOARD)-$(ARCH).img
 
 
 # =====
@@ -70,7 +71,8 @@ _CACHE_DIR = ./.cache
 _BUILD_DIR = ./.build
 _BUILT_IMAGE_CONFIG = ./.built.conf
 
-_RPI_RESULT_ROOTFS = $(_CACHE_DIR)/$(PROJECT).$(_OS_BOARD_ARCH).result
+_RESULT_ROOTFS = $(_CACHE_DIR)/$(PROJECT).$(_OS_BOARD_ARCH).rootfs
+_RESULT_IMAGE = $(_CACHE_DIR)/$(PROJECT).$(_OS_BOARD_ARCH).img
 
 
 # =====
@@ -94,7 +96,8 @@ $(call say,"Running configuration")
 @ echo "    PIKVM_REPO_URL = $(PIKVM_REPO_URL)"
 @ echo "    PIKVM_REPO_KEY = $(PIKVM_REPO_KEY)"
 @ echo
-@ echo "    CARD = $(CARD)"
+@ echo "    CARD  = $(CARD)"
+@ echo "    IMAGE = $(IMAGE)"
 endef
 
 define check_build
@@ -113,6 +116,7 @@ all:
 	@ echo "    make binfmt              # Configure ARM binfmt on the host system"
 	@ echo "    make scan                # Find all RPi devices in the local network"
 	@ echo "    make clean               # Remove the generated rootfs"
+	@ echo "    make image               # Make image file $(IMAGE)"
 	@ echo "    make install             # Format $(CARD) and flash the filesystem"
 	@ echo
 	$(call show_running_config)
@@ -139,9 +143,8 @@ shell: override RUN_OPTS:="$(RUN_OPTS) -i"
 shell: run
 
 
-toolbox: $(if $(filter-out x86_64,$(__HOST_ARCH)),,base)
+toolbox: $(if $(filter x86_64,$(__HOST_ARCH)),,base)
 	$(call say,"Ensuring toolbox image")
-	$(MAKE) -C base arch-$(BOARD)-$(ARCH)
 	$(MAKE) -C toolbox toolbox
 	$(call say,"Toolbox image is ready")
 
@@ -153,22 +156,17 @@ _binfmt-host.aarch64:
 	@ true
 _binfmt-host.x86_64: $(__DEP_TOOLBOX)
 	$(call say,"Ensuring $(ARCH) binfmt")
-	$(DOCKER_RUN_TTY) \
-			--privileged \
+	$(DOCKER_RUN_TTY) --privileged \
 		$(_TOOLBOX_IMAGE) \
-			/tools/install-binfmt \
-				--mount $(ARCH) /usr/bin/qemu-$(ARCH)-static
+			/tools/binfmt --mount $(ARCH) /usr/bin/qemu-$(ARCH)-static
 	$(call say,"Binfmt $(ARCH) is ready")
 
 
 scan: $(__DEP_TOOLBOX)
 	$(call say,"Searching for Pis in the local network")
-	$(DOCKER_RUN_TTY) \
-			--net host \
+	$(DOCKER_RUN_TTY) --net host \
 		$(_TOOLBOX_IMAGE) \
-			arp-scan \
-				--localnet \
-			| grep -Pi "\s(b8:27:eb:|dc:a6:32:)" || true
+			arp-scan --localnet | grep -Pi "\s(b8:27:eb:|dc:a6:32:)" || true
 
 
 # =====
@@ -199,7 +197,8 @@ os: $(__DEP_BINFMT) _buildctx
 _buildctx: base qemu
 	$(call say,"Assembling main Dockerfile")
 	$(eval _init = $(_BUILD_DIR)/stages/__init__/Dockerfile.part)
-	rm -rf $(_BUILD_DIR) $(_BUILT_IMAGE_CONFIG)
+	rm -f $(_BUILT_IMAGE_CONFIG)
+	rm -rf $(_BUILD_DIR)
 	mkdir -p $(_BUILD_DIR)
 	#
 	ln base/$(_OS_BOARD_ARCH).tgz $(_BUILD_DIR)
@@ -243,59 +242,72 @@ _qemu-host.x86_64:
 
 
 # =====
-clean:
+define remove_cachedir
+test ! -d $(_CACHE_DIR) || $(DOCKER_RUN_TTY) \
+		--volume $(shell pwd):/root/dir \
+		--workdir /root/dir \
+	$(_TOOLBOX_IMAGE) \
+		rm -rf $(shell basename $(_CACHE_DIR))
+endef
+
+
+clean: $(__DEP_TOOLBOX)
 	$(MAKE) -C toolbox clean
 	$(MAKE) -C qemu clean
 	$(MAKE) -C base clean
-	rm -rf $(_BUILD_DIR) $(_BUILT_IMAGE_CONFIG)
+	$(call remove_cachedir)
+	rm -f $(_BUILT_IMAGE_CONFIG) $(IMAGE)
+	rm -rf $(_BUILD_DIR)
 
 
-clean-all: $(__DEP_TOOLBOX) _cachedir clean
+clean-all: clean
 	$(MAKE) -C toolbox clean-all
 	$(MAKE) -C qemu clean-all
 	$(MAKE) -C base clean-all
-	$(DOCKER_RUN_TTY) \
-			--volume $(shell pwd)/$(_CACHE_DIR):/root/$(_CACHE_DIR) \
-			--workdir /root/$(_CACHE_DIR)/.. \
-		$(_TOOLBOX_IMAGE) \
-			rm -rf $(_RPI_RESULT_ROOTFS)
-	rm -rf $(_CACHE_DIR)
 
 
-extract: $(__DEP_TOOLBOX) _cachedir
+_CACHE_VOLUME_OPTS = \
+	--volume $(shell pwd)/$(_CACHE_DIR):/root/$(_CACHE_DIR) \
+	--workdir /root/$(_CACHE_DIR)/..
+
+
+extract: $(__DEP_TOOLBOX)
 	$(call check_build)
 	$(call say,"Extracting image from Docker")
-	$(DOCKER) save --output $(_RPI_RESULT_ROOTFS).tar $(call read_built_config,IMAGE)
-	$(DOCKER_RUN_TTY) run \
-			--volume $(shell pwd)/$(_CACHE_DIR):/root/$(_CACHE_DIR) \
-			--workdir /root/$(_CACHE_DIR)/.. \
+	$(call remove_cachedir)
+	mkdir -p $(_CACHE_DIR)
+	$(call cachetag,$(_CACHE_DIR))
+	#
+	$(DOCKER) save --output $(_RESULT_ROOTFS).tar $(call read_built_config,IMAGE)
+	$(DOCKER_RUN_TTY) $(_CACHE_VOLUME_OPTS) \
 		$(_TOOLBOX_IMAGE) \
 			/tools/docker-extract \
 				--remove-root \
-				--root $(_RPI_RESULT_ROOTFS) \
+				--root $(_RESULT_ROOTFS) \
 				--set-hostname "$(call read_built_config,HOSTNAME)" \
-				$(if $(filter-out x86_64,$(__HOST_ARCH)),,--remove-qemu) \
-			$(_RPI_RESULT_ROOTFS).tar
+				$(if $(filter x86_64,$(__HOST_ARCH)),--remove-qemu,) \
+			$(_RESULT_ROOTFS).tar
 	$(call say,"Extraction complete")
 
 
-install: $(__DEP_TOOLBOX) _cachedir extract
+install: $(__DEP_TOOLBOX) extract
 	$(call check_build)
 	$(call say,"Installing to $(CARD)")
-	cat disk.conf | $(DOCKER_RUN_TTY_INT) run \
-			--privileged \
-			--volume $(shell pwd)/$(_CACHE_DIR):/root/$(_CACHE_DIR) \
-			--workdir /root/$(_CACHE_DIR)/.. \
+	cat disk.conf | $(DOCKER_RUN_INT) --privileged $(_CACHE_VOLUME_OPTS) \
 		$(_TOOLBOX_IMAGE) \
-			/tools/card-install $(CARD) $(_RPI_RESULT_ROOTFS)
+			/tools/install card $(_RESULT_ROOTFS) $(CARD)
 	$(call say,"Installation complete")
 
 
-_cachedir: $(_CACHE_DIR)/CACHEDIR.TAG
-$(_CACHE_DIR)/CACHEDIR.TAG:
-	rm -rf $(_CACHE_DIR)
-	mkdir -p $(_CACHE_DIR)
-	$(call cachetag,$(_BUILD_DIR))
+image: $(__DEP_TOOLBOX) extract
+	$(call check_build)
+	$(call say,"Installing to $(IMAGE)")
+	touch $(_RESULT_IMAGE)
+	cat disk.conf | $(DOCKER_RUN_INT) --privileged $(_CACHE_VOLUME_OPTS) --volume /dev:/root/dev \
+		$(_TOOLBOX_IMAGE) \
+			/tools/install image /root $(_RESULT_ROOTFS) $(_RESULT_IMAGE)
+	mv $(_RESULT_IMAGE) $(IMAGE)
+	$(call say,"Installation complete")
 
 
 # =====

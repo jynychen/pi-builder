@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+# ========================================================================== #
+#                                                                            #
+#    disk - A parted/mkfs wrapper.                                           #
+#                                                                            #
+#    Copyright (C) 2022-2023  Maxim Devaev <mdevaev@gmail.com>               #
+#                                                                            #
+#    This program is free software: you can redistribute it and/or modify    #
+#    it under the terms of the GNU General Public License as published by    #
+#    the Free Software Foundation, either version 3 of the License, or       #
+#    (at your option) any later version.                                     #
+#                                                                            #
+#    This program is distributed in the hope that it will be useful,         #
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of          #
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the           #
+#    GNU General Public License for more details.                            #
+#                                                                            #
+#    You should have received a copy of the GNU General Public License       #
+#    along with this program.  If not, see <https://www.gnu.org/licenses/>.  #
+#                                                                            #
+# ========================================================================== #
+
+
+import sys
+import os
+import re
+import subprocess
+
+
+# =====
+def _run(cmd: list[str], input: (str | None)=None, read: bool=False) -> str:
+    print(f"CMD [ {sys.argv[0]} ] ==>", " ".join(cmd))
+    sys.stdout.flush()
+    proc = subprocess.Popen(
+        cmd,
+        stdin=(None if input is None else subprocess.PIPE),
+        stdout=(subprocess.PIPE if read else sys.stdout),
+        stderr=sys.stderr,
+        preexec_fn=os.setpgrp,
+    )
+    data = proc.communicate(None if input is None else input.encode())[0]
+    retcode = proc.poll()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    if retcode != 0:
+        raise SystemExit(1)
+    return (data.decode().strip() if read else "")
+
+
+# =====
+def _install_card(rootfs_path: str, dev_path: str, disk_conf: str) -> None:
+    _run(["dd", "if=/dev/zero", f"of={dev_path}", "bs=1M", "count=32"])
+    _run(["partprobe", dev_path])
+
+    _run(["/tools/disk", "format", dev_path], input=disk_conf)
+    _run(["/tools/disk", "mkfs", dev_path], input=disk_conf)
+
+    _run(["/tools/disk", "mount", dev_path, "__mnt__"], input=disk_conf)
+    to_copy = [os.path.join(rootfs_path, name) for name in os.listdir(rootfs_path)]
+    _run(["rsync", "-a", "--quiet", *to_copy, "__mnt__"])
+    _run(["/tools/disk", "umount", dev_path], input=disk_conf)
+
+
+def _install_image(devfs_prefix: str, rootfs_path: str, image_path: str, disk_conf: str) -> None:
+    size = int(_run(["du", "-Pbs", rootfs_path], read=True).split()[0])
+    size += 4096 * 1024 * 1024
+    size -= size % 4096
+    assert size % 4096 == 0
+    _run(["truncate", "-s", str(size), image_path])
+
+    loop_path = devfs_prefix + "/" + _run(["losetup", "-f"], read=True)
+    if not os.path.exists(loop_path):
+        _run(["mknod", loop_path, "b", "7", str(re.match(r".*(\d+)$", loop_path).group(1))])
+
+    _run(["losetup", loop_path, image_path])
+    try:
+        _install_card(rootfs_path, loop_path, disk_conf)
+    finally:
+        _run(["losetup", "-d", loop_path])
+
+
+# =====
+def main() -> None:
+    if len(sys.argv) <= 2:
+        raise SystemExit(f"Usage: {sys.argv[0]} <card|image> ...")
+    if sys.argv[1] == "card":
+        if len(sys.argv) != 4:
+            raise SystemExit(f"Usage: cat disk.conf | {sys.argv[0]} card /prefix/path /dev/path")
+        _install_card(sys.argv[2], sys.argv[3], sys.stdin.read())
+    elif sys.argv[1] == "image":
+        if len(sys.argv) != 5:
+            raise SystemExit(f"Usage: cat disk.conf | {sys.argv[0]} image /devfs/prefix /prefix/path /image/path")
+        _install_image(sys.argv[2], sys.argv[3], sys.argv[4], sys.stdin.read())
+    else:
+        raise SystemExit(f"Usage: {sys.argv[0]} <card|image> ...")
+
+
+if __name__ == "__main__":
+    main()

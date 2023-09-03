@@ -1,0 +1,19 @@
+#!/bin/bash
+set -ex
+
+test -n "$1"
+test -n "$2"
+ROOTFS="$1"
+CARD="$2"
+
+DISK_CONF=$(</dev/stdin)
+
+dd if=/dev/zero of="$CARD" bs=1M count=32
+partprobe "$CARD"
+
+echo -e "$DISK_CONF" | /tools/disk format "$CARD"
+echo -e "$DISK_CONF" | /tools/disk mkfs "$CARD"
+
+echo -e "$DISK_CONF" | /tools/disk mount "$CARD" __mnt__
+rsync -a --quiet "$ROOTFS"/* __mnt__
+echo -e "$DISK_CONF" | /tools/disk umount "$CARD"

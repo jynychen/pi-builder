@@ -34,7 +34,7 @@ toolbox:
 	test -n "$(_TOOLBOX_IMAGE)"
 	test -n "$(__HOST_ARCH)"
 	rm -f *.tgz Dockerfile
-	ln ../base/arch-$(BOARD)-$(ARCH).tgz .
+	test $(ARCH) != $(__HOST_ARCH) || ln ../base/arch-$(BOARD)-$(ARCH).tgz .
 	sed -i -e 's|%BASE_ROOTFS_TGZ%|arch-$(BOARD)-$(ARCH)|g' Dockerfile.$(__HOST_ARCH) > Dockerfile
 	cat Dockerfile.common >> Dockerfile
 	$(DOCKER) build \
